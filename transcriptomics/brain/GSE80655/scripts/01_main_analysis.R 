@@ -1,0 +1,318 @@
+# ============================================================================
+# GSE88890 Main Analysis Pipeline
+# Brain methylation (Illumina 450K): MDD suicide vs Control (BA11, BA25)
+# ============================================================================
+
+cat("\n=== GSE88890 Main Analysis Started ===\n")
+
+# ----------------------------------------------------------------------------
+# 1. Setup
+# ----------------------------------------------------------------------------
+library(data.table)
+library(limma)
+library(ggplot2)
+library(pheatmap)
+library(tidyverse)
+library(ChAMP)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+output_dir <- "GSE88890_Final_Results"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+cat("✓ Libraries loaded\n\n")
+
+# ----------------------------------------------------------------------------
+# 2. Extract metadata from series_matrix.txt
+# ----------------------------------------------------------------------------
+cat("--- Extracting metadata ---\n")
+
+series_matrix_file <- "GSE88890_series_matrix.txt"
+all_lines <- readLines(series_matrix_file)
+
+# Sample names (line containing !Sample_title)
+title_line <- all_lines[grep("^!Sample_title", all_lines)]
+title_parts <- unlist(strsplit(title_line[1], "\t"))
+sample_names <- gsub('"', '', title_parts[-1])
+
+# Extract all characteristics lines
+all_char <- grep("^!Sample_characteristics_ch1", all_lines, value = TRUE)
+
+# groupid
+groupid_line <- all_char[grep("groupid", all_char)]
+groupid_parts <- unlist(strsplit(groupid_line[1], "\t"))[-1]
+groupid_values <- gsub('"', '', groupid_parts)
+groupid_values <- gsub('.*groupid: ', '', groupid_values)
+
+# Region (Brodmann area)
+region_line <- all_char[grep("tissue|Brodmann", all_char)]
+region_parts <- unlist(strsplit(region_line[1], "\t"))[-1]
+region_values <- gsub('"', '', region_parts)
+brodmann_numbers <- gsub('.*Brodmann area ([0-9]+).*', '\\1', region_values)
+region_final <- paste0("BA", brodmann_numbers)
+
+# Gender
+gender_line <- all_char[grep("gender", all_char)]
+gender_parts <- unlist(strsplit(gender_line[1], "\t"))[-1]
+gender_values <- gsub('"', '', gender_parts)
+gender_values <- gsub('.*gender: ', '', gender_values)
+
+# Build targets table
+sample_id <- sprintf("Sample_%03d", 1:length(sample_names))
+phenotype_values <- ifelse(grepl("MDD suicide", groupid_values), "MDD_suicide", "Control")
+
+targets <- data.frame(
+  Sample_ID = sample_id,
+  Sample_Name = sample_names,
+  Phenotype = as.factor(phenotype_values),
+  Region = as.factor(region_final),
+  Gender = as.factor(gender_values),
+  stringsAsFactors = FALSE
+)
+rownames(targets) <- targets$Sample_ID
+
+cat(sprintf("✓ Extracted %d samples\n", nrow(targets)))
+write.csv(targets, file.path(output_dir, "00_Sample_Metadata.csv"), row.names = TRUE)
+cat("\n")
+
+# ----------------------------------------------------------------------------
+# 3. Load Beta matrix (skip 74 lines for series_matrix.txt format)
+# ----------------------------------------------------------------------------
+cat("--- Loading Beta matrix ---\n")
+
+Beta_raw <- fread(series_matrix_file, sep = "\t", header = TRUE,
+                  data.table = FALSE, skip = 74)
+
+rownames(Beta_raw) <- Beta_raw[[1]]
+Beta_raw <- Beta_raw[, -1]
+Beta <- as.matrix(Beta_raw)
+cat(sprintf("✓ Beta matrix: %d CpGs × %d samples\n", nrow(Beta), ncol(Beta)))
+
+# ----------------------------------------------------------------------------
+# 4. Quality control: remove NA and low-variance probes
+# ----------------------------------------------------------------------------
+cat("--- Quality control ---\n")
+
+na_per_probe <- rowSums(is.na(Beta))
+Beta_filtered <- Beta[na_per_probe == 0, ]
+
+probe_vars <- apply(Beta_filtered, 1, var, na.rm = TRUE)
+Beta_filtered <- Beta_filtered[probe_vars > 0.001, ]
+Beta_filtered <- as.matrix(Beta_filtered)
+
+cat(sprintf("✓ After filtering: %d CpGs\n\n", nrow(Beta_filtered)))
+
+# ----------------------------------------------------------------------------
+# 5. DMP analysis (limma)
+# ----------------------------------------------------------------------------
+cat("--- DMP analysis ---\n")
+
+design <- model.matrix(~targets$Phenotype)
+fit <- lmFit(Beta_filtered, design)
+fit <- eBayes(fit)
+
+DMP_results <- topTable(fit, coef = 2, number = Inf)
+
+sig_count <- sum(DMP_results$adj.P.Val < 0.05)
+hyper_count <- sum(DMP_results$adj.P.Val < 0.05 & DMP_results$logFC > 0)
+hypo_count <- sum(DMP_results$adj.P.Val < 0.05 & DMP_results$logFC < 0)
+
+cat(sprintf("✓ Significant DMPs (FDR<0.05): %d\n", sig_count))
+cat(sprintf("  - Hyper-methylated: %d\n", hyper_count))
+cat(sprintf("  - Hypo-methylated: %d\n\n", hypo_count))
+
+write.csv(DMP_results, file.path(output_dir, "02_DMP_Results.csv"), row.names = TRUE)
+
+# ----------------------------------------------------------------------------
+# 6. CHAMP annotation
+# ----------------------------------------------------------------------------
+cat("--- CHAMP annotation ---\n")
+
+data(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+cpg_annot <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+DMP_annotated <- cbind(
+  DMP_results,
+  Gene = cpg_annot[rownames(DMP_results), "UCSC_RefGene_Name"],
+  GenePart = cpg_annot[rownames(DMP_results), "UCSC_RefGene_Group"],
+  Chr = cpg_annot[rownames(DMP_results), "chr"],
+  Pos = cpg_annot[rownames(DMP_results), "pos"]
+)
+
+sig_dmp <- DMP_annotated[DMP_annotated$adj.P.Val < 0.05, ]
+cat(sprintf("✓ %d DMPs annotated\n\n", nrow(sig_dmp)))
+write.csv(sig_dmp, file.path(output_dir, "03_DMP_Annotated.csv"), row.names = TRUE)
+
+# ----------------------------------------------------------------------------
+# 7. Visualization: Volcano plot
+# ----------------------------------------------------------------------------
+cat("--- Volcano plot ---\n")
+
+pdf(file.path(output_dir, "04_VolcanoPlot.pdf"), width = 10, height = 8)
+plot(DMP_results$logFC, -log10(DMP_results$adj.P.Val),
+     main = "Volcano Plot: MDD Suicide vs Control",
+     xlab = "log2(Beta Change)", ylab = "-log10(Adjusted P-value)",
+     col = ifelse(DMP_results$adj.P.Val < 0.05, "red", "gray50"),
+     pch = 16, cex = 0.6)
+abline(h = -log10(0.05), lty = 2, col = "blue", lwd = 2)
+abline(v = c(-0.1, 0.1), lty = 2, col = "blue", lwd = 2)
+dev.off()
+cat("  ✓ Volcano plot saved\n")
+
+# ----------------------------------------------------------------------------
+# 8. Visualization: Heatmaps (Top 30 DMPs)
+# ----------------------------------------------------------------------------
+if (nrow(DMP_results) > 0) {
+  cat("--- Heatmaps ---\n")
+  
+  top_count <- min(30, nrow(DMP_results))
+  top_idx <- order(DMP_results$adj.P.Val)[1:top_count]
+  top_probes <- rownames(DMP_results)[top_idx]
+  top_beta <- Beta_filtered[top_probes, ]
+  
+  # Simple heatmap
+  pdf(file.path(output_dir, "05_Top30_Heatmap_Simple.pdf"), width = 12, height = 10)
+  pheatmap(top_beta, main = sprintf("Top %d DMPs", top_count),
+           scale = "row", show_colnames = FALSE,
+           clustering_distance_cols = "correlation")
+  dev.off()
+  cat("  ✓ Simple heatmap saved\n")
+  
+  # Annotated heatmap
+  anno_data <- data.frame(
+    Phenotype = as.character(targets$Phenotype),
+    Region = as.character(targets$Region),
+    Gender = as.character(targets$Gender),
+    row.names = targets$Sample_ID
+  )
+  
+  if (all(rownames(anno_data) %in% colnames(top_beta))) {
+    anno_colors <- list(
+      Phenotype = c("MDD_suicide" = "#E41A1C", "Control" = "#377EB8"),
+      Region = c("BA11" = "#4DAF4A", "BA25" = "#FF7F00"),
+      Gender = c("M" = "#666666", "F" = "#FF69B4")
+    )
+    
+    pdf(file.path(output_dir, "05_Top30_Heatmap_Annotated.pdf"), width = 12, height = 10)
+    pheatmap(top_beta, annotation_col = anno_data, annotation_colors = anno_colors,
+             main = sprintf("Top %d DMPs with Annotations", top_count),
+             scale = "row", show_colnames = FALSE,
+             clustering_distance_cols = "correlation")
+    dev.off()
+    cat("  ✓ Annotated heatmap saved\n\n")
+  }
+}
+
+# ----------------------------------------------------------------------------
+# 9. MDS plot
+# ----------------------------------------------------------------------------
+cat("--- MDS plot ---\n")
+
+dist_matrix <- as.matrix(dist(t(Beta_filtered)))
+mds_result <- cmdscale(dist_matrix, k = 2)
+
+pdf(file.path(output_dir, "06_MDS_Plot.pdf"), width = 10, height = 8)
+
+colors <- ifelse(targets$Phenotype == "MDD_suicide", "red", "blue")
+shapes <- ifelse(targets$Region == "BA11", 16, 17)
+
+plot(mds_result[, 1], mds_result[, 2],
+     main = "MDS Plot: Sample Clustering",
+     xlab = "Dimension 1", ylab = "Dimension 2",
+     col = colors, pch = shapes, cex = 1.5)
+
+legend("topright",
+       legend = c("MDD Suicide (BA11)", "MDD Suicide (BA25)",
+                  "Control (BA11)", "Control (BA25)"),
+       col = c("red", "red", "blue", "blue"),
+       pch = c(16, 17, 16, 17))
+
+dev.off()
+cat("✓ MDS plot saved\n\n")
+
+# ----------------------------------------------------------------------------
+# 10. Final report
+# ----------------------------------------------------------------------------
+cat("--- Final report ---\n")
+
+final_report <- sprintf("
+================================================================================
+                  GSE88890 Methylation Analysis Report
+         Brain Methylation and MDD Suicide Epigenetic Signatures
+================================================================================
+
+[Study Design]
+Source: GSE88890 (Illumina 450K)
+Platform: Human Methylation 450 BeadChip
+Method: ChAMP Pipeline + limma DMP
+
+[Sample Statistics]
+Total samples: %d
+- MDD suicide case: %d
+- Control: %d
+
+Brain regions:
+- BA11 (Dorsomedial prefrontal cortex): %d
+- BA25 (Subgenual anterior cingulate cortex): %d
+
+Gender:
+- Male: %d
+- Female: %d
+
+[Quality Control]
+Original probes: %d
+Filtered probes: %d (%.1f%%)
+
+[DMP Results]
+Significant DMPs (FDR<0.05): %d
+  - Hypermethylated: %d (%.1f%%)
+  - Hypomethylated: %d (%.1f%%)
+
+[Generated Files]
+✓ 00_Sample_Metadata.csv
+✓ 02_DMP_Results.csv
+✓ 03_DMP_Annotated.csv
+✓ 04_VolcanoPlot.pdf
+✓ 05_Top30_Heatmap_Simple.pdf
+✓ 05_Top30_Heatmap_Annotated.pdf
+✓ 06_MDS_Plot.pdf
+
+[Next Steps]
+1. DMR analysis: champ.DMR()
+2. Pathway enrichment: GO/KEGG
+3. Integration with blood methylation (GSE125105)
+
+================================================================================
+Completed: %s
+================================================================================
+",
+    nrow(targets),
+    sum(targets$Phenotype == "MDD_suicide"),
+    sum(targets$Phenotype == "Control"),
+    sum(targets$Region == "BA11"),
+    sum(targets$Region == "BA25"),
+    sum(targets$Gender == "M"),
+    sum(targets$Gender == "F"),
+    nrow(Beta),
+    nrow(Beta_filtered),
+    (nrow(Beta_filtered) / nrow(Beta)) * 100,
+    sig_count,
+    hyper_count,
+    if(sig_count > 0) (hyper_count/sig_count)*100 else 0,
+    hypo_count,
+    if(sig_count > 0) (hypo_count/sig_count)*100 else 0,
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+)
+
+cat(final_report)
+writeLines(final_report, file.path(output_dir, "FINAL_REPORT.txt"))
+
+# ----------------------------------------------------------------------------
+cat("\n✓✓✓ Analysis Complete! ✓✓✓\n")
+cat("Results saved to:", output_dir, "\n\n")
+
+if (nrow(sig_dmp) > 0) {
+  cat("Top 5 DMPs:\n")
+  top5 <- head(sig_dmp[order(sig_dmp$adj.P.Val), ], 5)
+  print(top5[, c("logFC", "adj.P.Val", "Gene")])
+} else {
+  cat("No significant DMPs found\n")
+}
