@@ -12,11 +12,11 @@ library(data.table)
 library(dplyr)
 library(limma)
 library(matrixStats)
+library(ggplot2)
 
-# ---- SCI plot saver (TIFF+PDF) ----
 save_sci_plot <- function(p, f, w=8, h=6) {
-  ggsave(f, p, device="tiff", w, h, dpi=300, compression="lzw")
-  ggsave(gsub("\\.tiff", ".pdf", f), p, device="pdf", w, h)
+  ggsave(filename = f, plot = p, device = "tiff", width = w, height = h, dpi = 300, compression = "lzw")
+  ggsave(filename = gsub("\\.tiff", ".pdf", f), plot = p, device = "pdf", width = w, height = h)
 }
 # Set working directory (modify as needed)
 # setwd("/path/to/GSE54563/")
@@ -239,19 +239,92 @@ summary_df <- data.frame(
             sprintf("%.4f", mean(abs(cohens_d), na.rm = TRUE)))
 )
 write.csv(summary_df, "GSE54563_Analysis_Summary.csv", row.names = FALSE)
-# ---- Enrichment: GO + KEGG + Reactome ----
-library(clusterProfiler); library(org.Hs.eg.db); library(ReactomePA); library(enrichplot)
-genes <- deg[abs(deg$logFC) > 1.0, "GeneSymbol"]
-cat(sprintf("Genes with |logFC|>1.0: %d\n", length(genes)))
-if(length(genes) > 10) {
-  entrez <- bitr(genes, "SYMBOL", "ENTREZID", org.Hs.eg.db)
-  if(nrow(entrez) > 0) {
-    go <- enrichGO(entrez$ENTREZID, org.Hs.eg.db, ont="BP", pvalueCutoff=0.05)
-    if(nrow(go)>0) write.csv(go, "GO_BP.csv") & save_sci_plot(dotplot(go), "GO_BP.tiff")
-    kegg <- enrichKEGG(entrez$ENTREZID, organism="hsa", pvalueCutoff=0.05)
-    if(nrow(kegg)>0) write.csv(kegg, "KEGG.csv") & save_sci_plot(barplot(kegg), "KEGG.tiff")
-    react <- enrichPathway(entrez$ENTREZID, pvalueCutoff=0.05)
-    if(nrow(react)>0) write.csv(react, "Reactome.csv") & save_sci_plot(dotplot(react), "Reactome.tiff")
+# ============================================================================
+# Enrichment Analysis: GO BP, KEGG, Reactome
+# ============================================================================
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(enrichplot)
+library(ggplot2)
+
+# ---- 1. Prepare gene list (P < 0.05) ----
+genes <- deg[deg$P.Value < 0.05, "GeneSymbol"]
+cat(sprintf("Genes with P<0.05: %d\n", length(genes)))
+
+if (length(genes) >= 10) {
+  entrez <- bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  cat(sprintf("Mapped ENTREZ IDs: %d\n", nrow(entrez)))
+  
+  if (nrow(entrez) > 0) {
+    # ---- 2. GO Biological Process ----
+    cat("\n--- Running GO BP enrichment ---\n")
+    go <- enrichGO(
+      gene = entrez$ENTREZID,
+      OrgDb = org.Hs.eg.db,
+      ont = "BP",
+      pvalueCutoff = 0.05,
+      qvalueCutoff = 0.05,
+      readable = TRUE
+    )
+    if (!is.null(go) && nrow(go) > 0) {
+      cat(sprintf("GO enriched terms: %d\n", nrow(go)))
+      write.csv(as.data.frame(go), "GO_BP_Enrichment.csv", row.names = FALSE)
+      save_sci_plot(dotplot(go, showCategory = 15), "GO_BP_Dotplot.tiff")
+    } else {
+      cat("No significant GO terms.\n")
+    }
+    
+    # ---- 3. KEGG Pathway (use local KEGG.db if available) ----
+    cat("\n--- Running KEGG enrichment ---\n")
+    options(timeout = 600)  # in case of network download
+    if (requireNamespace("KEGG.db", quietly = TRUE)) {
+      kegg <- enrichKEGG(
+        gene = entrez$ENTREZID,
+        organism = "hsa",
+        pvalueCutoff = 0.1,
+        qvalueCutoff = 0.2,
+        use_internal_data = TRUE
+      )
+    } else {
+      kegg <- enrichKEGG(
+        gene = entrez$ENTREZID,
+        organism = "hsa",
+        pvalueCutoff = 0.1,
+        qvalueCutoff = 0.2
+      )
+    }
+    if (!is.null(kegg) && nrow(kegg) > 0) {
+      cat(sprintf("KEGG enriched pathways: %d\n", nrow(kegg)))
+      kegg_readable <- setReadable(kegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+      write.csv(as.data.frame(kegg_readable), "KEGG_Enrichment.csv", row.names = FALSE)
+      save_sci_plot(barplot(kegg, showCategory = 15), "KEGG_Barplot.tiff")
+    } else {
+      cat("No significant KEGG pathways.\n")
+    }
+    
+    # ---- 4. Reactome Pathway ----
+    cat("\n--- Running Reactome enrichment ---\n")
+    react <- enrichPathway(
+      gene = entrez$ENTREZID,
+      organism = "human",
+      pvalueCutoff = 0.05,
+      readable = TRUE
+    )
+    if (!is.null(react) && nrow(react) > 0) {
+      cat(sprintf("Reactome enriched pathways: %d\n", nrow(react)))
+      write.csv(as.data.frame(react), "Reactome_Enrichment.csv", row.names = FALSE)
+      save_sci_plot(dotplot(react, showCategory = 15), "Reactome_Dotplot.tiff")
+    } else {
+      cat("No significant Reactome pathways.\n")
+    }
+    
+  } else {
+    cat("No ENTREZ IDs to map.\n")
   }
+} else {
+  cat("Too few genes (<10) for enrichment.\n")
 }
-cat("\n=== GSE54563 Pipeline Complete ===\n")
+
+cat("\n=== Enrichment analysis completed ===\n")
