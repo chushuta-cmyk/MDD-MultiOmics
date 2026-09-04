@@ -13,6 +13,11 @@ library(dplyr)
 library(limma)
 library(matrixStats)
 
+# ---- SCI plot saver (TIFF+PDF) ----
+save_sci_plot <- function(p, f, w=8, h=6) {
+  ggsave(f, p, device="tiff", w, h, dpi=300, compression="lzw")
+  ggsave(gsub("\\.tiff", ".pdf", f), p, device="pdf", w, h)
+}
 # Set working directory (modify as needed)
 # setwd("/path/to/GSE54563/")
 
@@ -97,6 +102,14 @@ expr_clean <- expr_matrix[!na_rows, ]
 cat(sprintf("Rows with NA removed: %d, remaining: %d\n",
             sum(na_rows), nrow(expr_clean)))
 
+max_val <- max(expr_clean, na.rm = TRUE)
+if (max_val > 50) {
+  cat(sprintf("Raw scale detected (max=%.2f), applying log2(x+1)...\n", max_val))
+  expr_clean <- log2(expr_clean + 1)
+} else {
+  cat("Data already in log2 scale, skipped.\n")
+}
+
 # Low-expression filter: require raw expression > 8 (log2 > 3) in at least 10% of samples
 keep <- rowSums(expr_clean > 8) >= 0.1 * ncol(expr_clean)
 expr_filtered <- expr_clean[keep, ]
@@ -157,7 +170,17 @@ fit2 <- eBayes(fit2)
 # Extract results
 deg <- topTable(fit2, coef = "MDD_vs_Control", number = Inf, adjust.method = "BH")
 deg$probe_id <- rownames(deg)
-
+# ---- Gene annotation & dedup (keep highest AvgExpr) ----
+library(AnnotationDbi)
+library(illuminaHumanv3.db)
+probe_means <- rowMeans(expr_filtered, na.rm = TRUE)
+symbols <- mapIds(illuminaHumanv3.db, keys = rownames(deg), column = "SYMBOL", 
+                  keytype = "PROBEID", multiVals = "first")
+deg$GeneSymbol <- symbols
+deg <- deg[!is.na(deg$GeneSymbol) & deg$GeneSymbol != "", ]
+deg$AvgExpr <- probe_means[rownames(deg)]
+deg <- deg[order(deg$AvgExpr, decreasing = TRUE), ]
+deg <- deg[!duplicated(deg$GeneSymbol), ]
 cat(sprintf("DEA complete. %d probes tested.\n", nrow(deg)))
 
 # ------------------------------------------------------------------------------
@@ -216,5 +239,19 @@ summary_df <- data.frame(
             sprintf("%.4f", mean(abs(cohens_d), na.rm = TRUE)))
 )
 write.csv(summary_df, "GSE54563_Analysis_Summary.csv", row.names = FALSE)
-
+# ---- Enrichment: GO + KEGG + Reactome ----
+library(clusterProfiler); library(org.Hs.eg.db); library(ReactomePA); library(enrichplot)
+genes <- deg[abs(deg$logFC) > 1.0, "GeneSymbol"]
+cat(sprintf("Genes with |logFC|>1.0: %d\n", length(genes)))
+if(length(genes) > 10) {
+  entrez <- bitr(genes, "SYMBOL", "ENTREZID", org.Hs.eg.db)
+  if(nrow(entrez) > 0) {
+    go <- enrichGO(entrez$ENTREZID, org.Hs.eg.db, ont="BP", pvalueCutoff=0.05)
+    if(nrow(go)>0) write.csv(go, "GO_BP.csv") & save_sci_plot(dotplot(go), "GO_BP.tiff")
+    kegg <- enrichKEGG(entrez$ENTREZID, organism="hsa", pvalueCutoff=0.05)
+    if(nrow(kegg)>0) write.csv(kegg, "KEGG.csv") & save_sci_plot(barplot(kegg), "KEGG.tiff")
+    react <- enrichPathway(entrez$ENTREZID, pvalueCutoff=0.05)
+    if(nrow(react)>0) write.csv(react, "Reactome.csv") & save_sci_plot(dotplot(react), "Reactome.tiff")
+  }
+}
 cat("\n=== GSE54563 Pipeline Complete ===\n")
