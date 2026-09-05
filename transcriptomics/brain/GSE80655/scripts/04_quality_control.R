@@ -14,6 +14,7 @@ library(org.Hs.eg.db)
 library(ReactomePA)
 library(enrichplot)
 
+source("plot_generator.r")
 cat("\n=== GSE80655 Differential Expression & Enrichment Started ===\n")
 
 # ------------------------------------------------------------------------------
@@ -150,25 +151,66 @@ cat(sprintf("\nTotal merged DEGs (P < 0.01): %d\n", nrow(all_degs)))
 write.csv(all_degs, "GSE80655_MDD_vs_Control_BrainRegion_DEGs.csv", row.names = FALSE)
 cat("✅ Saved: GSE80655_MDD_vs_Control_BrainRegion_DEGs.csv\n")
 
-# ------------------------------------------------------------------------------
-# 4. Visualization: Volcano Plot and MA Plot (using merged results)
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 4. Visualization: Volcano Plots (Per Region + Merged)
+# ==============================================================================
 cat("\n--- Generating visualization plots ---\n")
 
-# 4a. Volcano Plot
-p_volcano <- ggplot(all_degs, aes(x = logFC, y = -log10(P.Value), color = abs(logFC) > 0.5 & P.Value < 0.05)) +
-  geom_point(alpha = 0.6, size = 1.2) +
-  scale_color_manual(values = c("grey60", "red")) +
-  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "blue", alpha = 0.5) +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue", alpha = 0.5) +
-  labs(title = "GSE80655 MDD vs Control (All Brain Regions)", 
-       x = "log2 Fold Change", y = "-log10(P-value)") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "none")
-save_sci_plot(p_volcano, "Volcano_GSE80655.tiff")
-cat("✅ Saved: Volcano_GSE80655.tiff / .pdf\n")
+# 4a. volcano map for each brain region
+for (region in regions) {
+  region_degs <- deg_results_by_region[[region]]
+  
+  # mark significant genes |logFC| > 0.5 且 P < 0.05
+  region_degs$Significant <- ifelse(
+    abs(region_degs$logFC) > 0.5 & region_degs$P.Value < 0.05,
+    "Significant", "Not Significant"
+  )
+  
+  # count significant genes number
+  n_sig <- sum(region_degs$Significant == "Significant")
+  
+  p <- ggplot(region_degs, aes(x = logFC, y = -log10(P.Value))) +
+    geom_point(aes(color = Significant), alpha = 0.6, size = 1.2) +
+    scale_color_manual(values = c("Not Significant" = "grey70", "Significant" = "red")) +
+    geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "blue", alpha = 0.5) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "blue", alpha = 0.5) +
+    labs(
+      title = paste("GSE80655", region, "MDD vs Control"),
+      subtitle = paste("Significant DEGs (|logFC| > 0.5, P < 0.05):", n_sig),
+      x = "log2 Fold Change",
+      y = "-log10(P-value)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+  
+  save_sci_plot(p, paste0("Volcano_", region, ".tiff"))
+  cat(paste("✅ Saved: Volcano_", region, ".tiff / .pdf (", n_sig, " DEGs)\n", sep = ""))
+}
 
-# 4b. MA Plot
+# 4b. combine volcano maps show regions in different colors.
+all_degs$Region <- factor(all_degs$Region, levels = regions)
+all_degs$Significant <- ifelse(
+  abs(all_degs$logFC) > 0.5 & all_degs$P.Value < 0.05,
+  "Significant", "Not Significant"
+)
+
+p_merged <- ggplot(all_degs, aes(x = logFC, y = -log10(P.Value))) +
+  geom_point(aes(color = Region, shape = Significant), alpha = 0.5, size = 1.0) +
+  scale_shape_manual(values = c("Not Significant" = 1, "Significant" = 19)) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "black", alpha = 0.3) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.3) +
+  labs(
+    title = "GSE80655 MDD vs Control (All Brain Regions)",
+    x = "log2 Fold Change",
+    y = "-log10(P-value)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+save_sci_plot(p_merged, "Volcano_GSE80655_Merged.tiff")
+cat("✅ Saved: Volcano_GSE80655_Merged.tiff / .pdf\n")
+
+# MA Plot
 avg_expr <- rowMeans(vsd_matrix, na.rm = TRUE)
 all_degs$AveExpr <- avg_expr[match(all_degs$GeneSymbol, rownames(vsd_matrix))]
 
@@ -182,6 +224,45 @@ p_ma <- ggplot(all_degs, aes(x = AveExpr, y = logFC, color = abs(logFC) > 0.5)) 
   theme(legend.position = "none")
 save_sci_plot(p_ma, "MA_GSE80655.tiff")
 cat("✅ Saved: MA_GSE80655.tiff / .pdf\n")
+
+# ==============================================================================
+# 4d. DEG Heatmap (Per Region) — using plot_generator.r
+# ==============================================================================
+cat("\n--- Generating DEG heatmaps per region (using plot_generator) ---\n")
+
+for (region in regions) {
+  region_degs <- deg_results_by_region[[region]]
+  
+  if (nrow(region_degs) < 2) {
+    cat(sprintf("  - Skipping %s: only %d DEGs\n", region, nrow(region_degs)))
+    next
+  }
+  
+  # 1. Add ProbeID column for matching with expression matrix row names
+  region_degs$ProbeID <- region_degs$GeneSymbol
+  
+  # 2. Extract VST expression matrix for this region
+  current_gsm <- regions_list[[region]]
+  expr_sub <- vsd_matrix[, colnames(vsd_matrix) %in% current_gsm, drop = FALSE]
+  expr_sub <- expr_sub[, match(current_gsm, colnames(expr_sub)), drop = FALSE]
+  
+  # 3. Prepare group factor (named vector)
+  current_metadata <- metadata[metadata$GSM_ID %in% current_gsm, ]
+  current_metadata <- current_metadata[match(colnames(expr_sub), current_metadata$GSM_ID), ]
+  group_vec <- current_metadata$Diagnosis
+  names(group_vec) <- current_metadata$GSM_ID
+  
+  # 4. Call heatmap function from plot_generator.r
+  plot_deg_heatmap(
+    deg_df = region_degs,
+    expr_matrix = expr_sub,
+    group_factor = group_vec,
+    top_n = 40,
+    plot_title = paste("GSE80655 Top 40 DEGs -", region),
+    output_prefix = paste0("Heatmap_", region),
+    output_dir = "."
+  )
+}
 
 # ------------------------------------------------------------------------------
 # 5. Functional Enrichment (GO, KEGG, Reactome)
